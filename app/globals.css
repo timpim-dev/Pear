@@ -1,26 +1,78 @@
 @import "tailwindcss";
 
+/* ─── Light mode (default) ─────────────────────────────────────────────────── */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --pear-green: #6abf69;
+  --pear-green-light: #a8d8a8;
+  --pear-green-dark: #3d8b3d;
+
+  /* Semantic surface tokens — used everywhere via Tailwind utilities */
+  --bg:           #f7f5f0;   /* page background  */
+  --bg-card:      #ffffff;   /* card / panel     */
+  --bg-subtle:    #efecea;   /* input, code bg   */
+  --fg:           #1a1f1a;   /* primary text     */
+  --fg-muted:     #4a5249;   /* secondary text   */
+  --border:       rgba(106,191,105,0.18);
 }
 
+/* ─── Dark mode — toggled by adding class="dark" on <html> ─────────────────── */
+.dark {
+  --bg:           #161b16;
+  --bg-card:      #1f261f;
+  --bg-subtle:    #252d25;
+  --fg:           #e8f0e8;
+  --fg-muted:     #8faa8f;
+  --border:       rgba(106,191,105,0.14);
+}
+
+/* ─── Tailwind theme tokens ─────────────────────────────────────────────────── */
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
+  --color-pear-green:       var(--pear-green);
+  --color-pear-green-light: var(--pear-green-light);
+  --color-pear-green-dark:  var(--pear-green-dark);
+
+  /* Semantic aliases so we can write bg-surface, text-fg, etc. */
+  --color-surface:      var(--bg);
+  --color-card:         var(--bg-card);
+  --color-subtle:       var(--bg-subtle);
+  --color-fg:           var(--fg);
+  --color-fg-muted:     var(--fg-muted);
+  --color-border-pear:  var(--border);
+
+  --font-sans: var(--font-nunito);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+/* ─── Base ──────────────────────────────────────────────────────────────────── */
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-nunito), "Nunito", system-ui, sans-serif;
+  transition: background 0.2s ease, color 0.2s ease;
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+*:focus-visible {
+  outline: 2px solid var(--pear-green);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* ─── Animations ────────────────────────────────────────────────────────────── */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in { animation: fadeIn 0.4s ease-out both; }
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.6; }
+}
+.animate-pulse-soft { animation: pulse-soft 2s ease-in-out infinite; }
+
+/* ─── Card hover lift ───────────────────────────────────────────────────────── */
+.card-hover { transition: transform 0.2s ease, box-shadow 0.2s ease; }
+.card-hover:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 12px 32px rgba(106,191,105,0.18);
 }
