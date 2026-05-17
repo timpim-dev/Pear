@@ -25,6 +25,10 @@ export const metadata: Metadata = {
   },
 };
 
+// Theme init script — runs before first paint to avoid flash.
+// Must be a plain string, no template literals with backticks inside.
+const themeScript = `(function(){try{var t=localStorage.getItem('pear-theme');var d=window.matchMedia('(prefers-color-scheme:dark)').matches;if(t==='dark'||(t===null&&d)){document.documentElement.classList.add('dark');}}catch(e){}})();`;
+
 export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
@@ -34,29 +38,17 @@ export default function RootLayout({
       className={`${nunito.variable} ${geistMono.variable} h-full antialiased`}
       suppressHydrationWarning
     >
-      <head>
-        {/*
-         * Inline script runs before the first paint so the correct theme class
-         * is applied to <html> before any CSS or React hydration.
-         * This prevents the white flash you'd get if we waited for useEffect.
-         */}
-        <script
-          dangerouslySetInnerHTML={{
-            __html: `
-              (function() {
-                try {
-                  var stored = localStorage.getItem('pear-theme');
-                  var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-                  if (stored === 'dark' || (!stored && prefersDark)) {
-                    document.documentElement.classList.add('dark');
-                  }
-                } catch(e) {}
-              })();
-            `,
-          }}
-        />
-      </head>
+      {/*
+       * Do NOT add a <head> tag here — Next.js App Router manages <head> itself.
+       * Adding one causes a hydration mismatch that prevents React from attaching
+       * event handlers (buttons appear to work but do nothing).
+       *
+       * Instead, use the Next.js `Script` component or place inline scripts
+       * directly as children of <html> before <body>.
+       */}
       <body className="min-h-full flex flex-col bg-surface text-fg">
+        {/* Inline theme script — before any content so there's no flash */}
+        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
         {children}
       </body>
     </html>
