@@ -5,15 +5,15 @@ import { ThemeToggle } from "@/components/ThemeToggle";
 
 // Generate a cryptographically-safe base64url key for AES-GCM (256-bit).
 // The key lives ONLY in the URL hash — never sent to the server.
-async function generateRoomUrl(type: "file" | "call"): Promise<string> {
+//
+// We use crypto.getRandomValues (available in all contexts, including HTTP)
+// to generate 32 random bytes directly. crypto.subtle.generateKey requires
+// a secure context (HTTPS or localhost) and would fail on local network IPs.
+function generateRoomUrl(type: "file" | "call"): string {
   const roomId = nanoid(12);
-  const key = await window.crypto.subtle.generateKey(
-    { name: "AES-GCM", length: 256 },
-    true,
-    ["encrypt", "decrypt"]
-  );
-  const rawKey = await window.crypto.subtle.exportKey("raw", key);
-  const keyB64 = btoa(String.fromCharCode(...new Uint8Array(rawKey)))
+  // 32 random bytes = 256-bit key — safe to use with AES-GCM
+  const rawKey = crypto.getRandomValues(new Uint8Array(32));
+  const keyB64 = btoa(String.fromCharCode(...rawKey))
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
@@ -23,11 +23,11 @@ async function generateRoomUrl(type: "file" | "call"): Promise<string> {
 
 export default function Home() {
   // Use window.location.href (not router.push) — Next.js App Router strips hash fragments
-  async function handleSendFile() {
-    window.location.href = await generateRoomUrl("file");
+  function handleSendFile() {
+    window.location.href = generateRoomUrl("file");
   }
-  async function handleStartCall() {
-    window.location.href = await generateRoomUrl("call");
+  function handleStartCall() {
+    window.location.href = generateRoomUrl("call");
   }
 
   return (
