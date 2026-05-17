@@ -23,6 +23,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams } from "next/navigation";
 import SimplePeer from "simple-peer";
 import { SignalingChannel } from "@/lib/signaling";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 type CallStatus = "idle" | "waiting" | "connecting" | "connected" | "ended" | "error";
 
@@ -257,9 +258,12 @@ export default function CallPage() {
       {/* Pre-call overlay */}
       {status === "idle" && (
         <div className="absolute inset-0 flex flex-col items-center justify-center bg-pear-dark z-20 animate-fade-in px-4">
-          <a href="/" className="text-2xl font-extrabold text-white tracking-tight mb-2">
-            Pear
-          </a>
+          <div className="flex items-center gap-3 mb-2">
+            <a href="/" className="text-2xl font-extrabold text-white tracking-tight">
+              Pear
+            </a>
+            <ThemeToggle />
+          </div>
           <p className="text-pear-green/70 text-sm mb-10">Encrypted video call</p>
 
           <div className="bg-white/5 border border-white/10 rounded-2xl p-8 w-full max-w-md text-center">
