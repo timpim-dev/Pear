@@ -92,7 +92,9 @@ export default function RoomPage() {
 
     const signaling = new SignalingChannel(roomId);
     signalingRef.current = signaling;
-    await signaling.connect();
+
+    // Buffer signals that arrive before the peer is created
+    const pendingSignals: unknown[] = [];
 
     const peer = new SimplePeer({
       initiator: isInitiator,
@@ -111,12 +113,25 @@ export default function RoomPage() {
       await signaling.send(type, data);
     });
 
+    // Register signal handlers BEFORE connecting so we don't miss any messages
+    // from a peer that's already waiting in the room.
     signaling.onSignal((msg) => {
       if (msg.type === "offer" || msg.type === "answer" || msg.type === "ice") {
-        peer.signal(msg.payload);
+        if (peerRef.current) {
+          peerRef.current.signal(msg.payload);
+        } else {
+          pendingSignals.push(msg.payload);
+        }
       }
       if (msg.type === "join" && isInitiator) setStatus("connecting");
     });
+
+    await signaling.connect();
+
+    // Feed any signals that arrived during connect
+    for (const sig of pendingSignals) {
+      peer.signal(sig as SimplePeer.SignalData);
+    }
 
     peer.on("connect", () => setStatus("connected"));
     peer.on("error", (err) => {

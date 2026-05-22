@@ -230,16 +230,18 @@ export default function CallPage() {
         // the other peer's "join" or any signals that arrive immediately.
         signaling.onSignal((msg) => {
           if (msg.type === "join") {
-            // Another peer joined — we were here first, so we're the initiator
+            // Another peer joined — we were here first, so we're the initiator.
+            // Send "ready" back so the new peer knows to become the responder.
             if (!peerRef.current) {
               isInitiatorRef.current = true;
               setStatus("connecting");
               createPeer(stream, signaling, true);
+              signaling.send("ready", { peerId: signaling.id });
             }
           }
           if (msg.type === "ready") {
-            // The other peer was already waiting — they will initiate when they
-            // receive our "join". We just need to be ready as a responder.
+            // The other peer is already waiting and will initiate.
+            // We become the responder.
             if (!peerRef.current) {
               isInitiatorRef.current = false;
               setStatus("connecting");
