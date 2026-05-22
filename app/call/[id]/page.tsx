@@ -3,19 +3,16 @@
 /**
  * Video Call Room — /call/[id]
  *
- * How it works:
- *   1. Both peers navigate to /call/[id]#key
- *   2. The first peer (initiator) gets their local stream (camera + mic)
- *      and creates a simple-peer instance with initiator: true.
- *   3. The second peer (responder) does the same but with initiator: false.
- *   4. simple-peer handles the full WebRTC negotiation: offer, answer, ICE.
- *   5. Video/audio streams flow P2P via WebRTC — the server is never involved.
+ * Code-based room system:
+ *   1. Both peers navigate to /call/CODE (same 6-char room code)
+ *   2. The first peer to arrive becomes the initiator automatically
+ *   3. When the second peer joins, signaling negotiates the WebRTC connection
+ *   4. Video/audio streams flow P2P via WebRTC — the server is never involved
  *
  * Screen sharing:
  *   getDisplayMedia() replaces the video track sent to the remote peer.
  *   The local video preview also switches to the screen share feed.
  *
- * The URL hash key is used for room identification context only in this page.
  * (Video streams are already E2E encrypted by WebRTC's DTLS-SRTP.)
  */
 
@@ -25,18 +22,16 @@ import SimplePeer from "simple-peer";
 import { SignalingChannel } from "@/lib/signaling";
 import { ThemeToggle } from "@/components/ThemeToggle";
 
-type CallStatus = "idle" | "setup" | "waiting" | "connecting" | "connected" | "ended" | "error";
+type CallStatus = "setup" | "waiting" | "connecting" | "connected" | "ended" | "error";
 
 export default function CallPage() {
   const params = useParams();
-  const roomId = params.id as string;
+  const roomCode = (params.id as string).toUpperCase();
 
-  const [status, setStatus] = useState<CallStatus>("idle");
+  const [status, setStatus] = useState<CallStatus>("setup");
   const [isMuted, setIsMuted] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
-  const [shareUrl, setShareUrl] = useState("");
-  const [copied, setCopied] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
 
   // Device selection
@@ -54,18 +49,22 @@ export default function CallPage() {
   const signalingRef = useRef<SignalingChannel | null>(null);
   const isInitiatorRef = useRef(false);
   const pendingSignalsRef = useRef<unknown[]>([]);
-
-  useEffect(() => {
-    if (typeof window !== "undefined") {
-      setShareUrl(window.location.href);
-    }
-  }, []);
+  const setupDoneRef = useRef(false);
 
   // Stop preview stream on unmount
   useEffect(() => {
     return () => {
       localStreamRef.current?.getTracks().forEach((t) => t.stop());
     };
+  }, []);
+
+  // Auto-start camera preview on mount
+  useEffect(() => {
+    if (!setupDoneRef.current) {
+      setupDoneRef.current = true;
+      startPreview();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ─── Device enumeration ─────────────────────────────────────────────────────
@@ -205,11 +204,10 @@ export default function CallPage() {
     return peer;
   }
 
-  // ─── Start the call (after setup) ───────────────────────────────────────────
+  // ─── Join the room (auto-negotiate initiator) ──────────────────────────────
 
-  const connectCall = useCallback(
-    async (isInitiator: boolean) => {
-      isInitiatorRef.current = isInitiator;
+  const joinRoom = useCallback(
+    async () => {
       setStatus("waiting");
 
       const stream = localStreamRef.current;
@@ -225,18 +223,27 @@ export default function CallPage() {
       }
 
       try {
-        const signaling = new SignalingChannel(roomId);
+        const signaling = new SignalingChannel(roomCode);
         signalingRef.current = signaling;
 
         // Register signal handlers BEFORE connecting so we don't miss
         // the other peer's "join" or any signals that arrive immediately.
         signaling.onSignal((msg) => {
           if (msg.type === "join") {
-            if (isInitiator && !peerRef.current) {
-              // The joiner is subscribed and ready — NOW create our peer.
-              // This ensures the offer we generate will actually be received.
+            // Another peer joined — we were here first, so we're the initiator
+            if (!peerRef.current) {
+              isInitiatorRef.current = true;
               setStatus("connecting");
               createPeer(stream, signaling, true);
+            }
+          }
+          if (msg.type === "ready") {
+            // The other peer was already waiting — they will initiate when they
+            // receive our "join". We just need to be ready as a responder.
+            if (!peerRef.current) {
+              isInitiatorRef.current = false;
+              setStatus("connecting");
+              createPeer(stream, signaling, false);
             }
           }
           if (msg.type === "offer" || msg.type === "answer" || msg.type === "ice") {
@@ -251,19 +258,18 @@ export default function CallPage() {
 
         await signaling.connect();
 
-        // Non-initiator: create peer immediately (it's passive, waits for offer)
-        if (!isInitiator) {
-          createPeer(stream, signaling, false);
-        }
-        // Initiator: peer is created when we receive a "join" from the joiner
+        // After connecting, announce we're ready.
+        // If someone else is already in the room, they'll see our "join" and initiate.
+        // If we're first, we'll wait and see their "join" later.
+        await signaling.send("ready", { peerId: signaling.id });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        setErrorMsg(`Failed to start call: ${msg}`);
+        setErrorMsg(`Failed to join room: ${msg}`);
         setStatus("error");
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [roomId]
+    [roomCode]
   );
 
   // ─── Cleanup ────────────────────────────────────────────────────────────────
@@ -371,74 +377,11 @@ export default function CallPage() {
     setStatus("ended");
   }
 
-  function copyLink() {
-    navigator.clipboard.writeText(shareUrl).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    });
-  }
-
   // ─── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <main className="min-h-screen bg-pear-dark flex flex-col items-center justify-center relative overflow-hidden">
-      {/* Pre-call overlay — choose Host or Join */}
-      {status === "idle" && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-pear-dark z-20 animate-fade-in px-4">
-          <div className="flex items-center gap-3 mb-2">
-            <a href="/" className="text-2xl font-extrabold text-white tracking-tight">
-              Pear
-            </a>
-            <ThemeToggle />
-          </div>
-          <p className="text-pear-green/70 text-sm mb-10">Encrypted video call</p>
-
-          <div className="bg-white/5 border border-white/10 rounded-2xl p-8 w-full max-w-md text-center">
-            <h2 className="text-xl font-bold text-white mb-2">Ready to call?</h2>
-            <p className="text-white/50 text-sm mb-6">
-              Share the link with your contact, then set up your camera.
-            </p>
-
-            {/* Share link */}
-            <div className="flex items-center gap-2 mb-6">
-              <input
-                readOnly
-                value={shareUrl}
-                className="flex-1 text-xs font-mono bg-white/10 border border-white/10 rounded-xl px-3 py-2 text-white/70 truncate"
-              />
-              <button
-                onClick={copyLink}
-                className="shrink-0 px-4 py-2 rounded-xl bg-pear-green text-white text-sm font-bold hover:bg-pear-green-dark transition-colors"
-              >
-                {copied ? "Copied!" : "Copy"}
-              </button>
-            </div>
-
-            <div className="flex gap-3">
-              <button
-                onClick={() => {
-                  isInitiatorRef.current = true;
-                  startPreview();
-                }}
-                className="flex-1 py-3 rounded-2xl bg-pear-green text-white font-bold hover:bg-pear-green-dark transition-colors active:scale-95"
-              >
-                Start Call (Host)
-              </button>
-              <button
-                onClick={() => {
-                  isInitiatorRef.current = false;
-                  startPreview();
-                }}
-                className="flex-1 py-3 rounded-2xl bg-white/10 text-white font-bold border border-white/15 hover:bg-white/15 transition-colors active:scale-95"
-              >
-                Join Call
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Setup overlay — camera preview + device selection */}
+      {/* Setup overlay — camera preview + device selection + room code display */}
       {status === "setup" && (
         <div className="absolute inset-0 flex flex-col items-center justify-center bg-pear-dark z-20 animate-fade-in px-4">
           <div className="flex items-center gap-3 mb-2">
@@ -450,6 +393,21 @@ export default function CallPage() {
           <p className="text-pear-green/70 text-sm mb-6">Check your camera &amp; mic</p>
 
           <div className="bg-white/5 border border-white/10 rounded-2xl p-6 w-full max-w-lg">
+            {/* Room code badge */}
+            <div className="flex items-center justify-center gap-2 mb-5">
+              <span className="text-white/40 text-xs font-semibold uppercase tracking-wider">Room</span>
+              <div className="flex items-center gap-0.5">
+                {roomCode.split("").map((char, i) => (
+                  <span
+                    key={i}
+                    className="w-8 h-10 flex items-center justify-center rounded-lg bg-white/10 border border-white/10 text-lg font-extrabold text-pear-green font-mono"
+                  >
+                    {char}
+                  </span>
+                ))}
+              </div>
+            </div>
+
             {/* Camera preview */}
             <div className="relative aspect-video rounded-xl overflow-hidden bg-black mb-5">
               <video
@@ -498,10 +456,10 @@ export default function CallPage() {
 
             {/* Join button */}
             <button
-              onClick={() => connectCall(isInitiatorRef.current)}
+              onClick={joinRoom}
               className="w-full py-3 rounded-2xl bg-pear-green text-white font-bold text-lg hover:bg-pear-green-dark transition-colors active:scale-95"
             >
-              {isInitiatorRef.current ? "Start Call" : "Join Call"}
+              Join Room
             </button>
           </div>
         </div>
@@ -545,6 +503,20 @@ export default function CallPage() {
         {/* Waiting state shown over remote video */}
         {(status === "waiting" || status === "connecting") && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-pear-dark/80">
+            {/* Room code display */}
+            <div className="flex items-center gap-2 mb-6">
+              <span className="text-white/40 text-xs font-semibold uppercase tracking-wider">Room</span>
+              <div className="flex items-center gap-0.5">
+                {roomCode.split("").map((char, i) => (
+                  <span
+                    key={i}
+                    className="w-8 h-10 flex items-center justify-center rounded-lg bg-white/10 border border-white/10 text-lg font-extrabold text-pear-green font-mono"
+                  >
+                    {char}
+                  </span>
+                ))}
+              </div>
+            </div>
             <div className="w-3 h-3 rounded-full bg-pear-green animate-pulse-soft mb-3" />
             <p className="text-white/70 text-sm">
               {status === "waiting" ? "Waiting for the other person..." : "Connecting..."}

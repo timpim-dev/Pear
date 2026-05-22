@@ -1,33 +1,51 @@
 "use client";
 
-import { nanoid } from "nanoid";
+import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { ThemeToggle } from "@/components/ThemeToggle";
 
-// Generate a cryptographically-safe base64url key for AES-GCM (256-bit).
-// The key lives ONLY in the URL hash — never sent to the server.
-//
-// We use crypto.getRandomValues (available in all contexts, including HTTP)
-// to generate 32 random bytes directly. crypto.subtle.generateKey requires
-// a secure context (HTTPS or localhost) and would fail on local network IPs.
-function generateRoomUrl(type: "file" | "call"): string {
-  const roomId = nanoid(12);
-  // 32 random bytes = 256-bit key — safe to use with AES-GCM
-  const rawKey = crypto.getRandomValues(new Uint8Array(32));
-  const keyB64 = btoa(String.fromCharCode(...rawKey))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-  // Hash fragment (#key) is never included in HTTP requests
-  return `/${type === "file" ? "room" : "call"}/${roomId}#${keyB64}`;
+/**
+ * Generate a short, human-readable 6-character room code.
+ * Uses uppercase letters + digits, excluding ambiguous chars (0/O, 1/I/L).
+ */
+function generateRoomCode(): string {
+  const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  return Array.from(bytes, (b) => chars[b % chars.length]).join("");
 }
 
 export default function Home() {
-  // Use window.location.href (not router.push) — Next.js App Router strips hash fragments
-  function handleSendFile() {
-    window.location.href = generateRoomUrl("file");
+  const router = useRouter();
+  const [joinCode, setJoinCode] = useState("");
+  const [createdCode, setCreatedCode] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [joinError, setJoinError] = useState("");
+
+  function handleCreateRoom() {
+    const code = generateRoomCode();
+    setCreatedCode(code);
+    setCopied(false);
   }
-  function handleStartCall() {
-    window.location.href = generateRoomUrl("call");
+
+  function handleJoinRoom() {
+    const code = joinCode.trim().toUpperCase().replace(/\s/g, "");
+    if (code.length < 4) {
+      setJoinError("Enter a valid room code");
+      return;
+    }
+    setJoinError("");
+    router.push(`/call/${code}`);
+  }
+
+  function handleGoToRoom() {
+    router.push(`/call/${createdCode}`);
+  }
+
+  function handleCopyCode() {
+    navigator.clipboard.writeText(createdCode).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
   }
 
   return (
@@ -65,29 +83,92 @@ export default function Home() {
           Pear
         </h1>
         <p className="text-xl sm:text-2xl text-fg-muted font-medium max-w-lg mx-auto mb-3">
-          Share anything. Meet anyone. Privately.
+          Video calls with a room code. That&apos;s it.
         </p>
         <p className="text-sm text-fg-muted/70 max-w-md mx-auto mb-12">
-          End-to-end encrypted, peer-to-peer — your files and video go directly
+          End-to-end encrypted, peer-to-peer — your video goes directly
           between browsers. Nothing touches a server.
         </p>
 
-        {/* CTAs */}
-        <div className="flex flex-col sm:flex-row gap-4 justify-center">
-          <button
-            onClick={handleSendFile}
-            className="group px-8 py-4 rounded-2xl bg-pear-green text-white font-bold text-lg shadow-md shadow-pear-green/30 hover:bg-pear-green-dark hover:shadow-lg hover:shadow-pear-green/40 active:scale-95 transition-all duration-200"
-          >
-            Send a File
-            <span className="inline-block ml-2 group-hover:translate-x-1 transition-transform duration-200">&rarr;</span>
-          </button>
-          <button
-            onClick={handleStartCall}
-            className="group px-8 py-4 rounded-2xl bg-card text-fg font-bold text-lg border-2 border-border-pear hover:border-pear-green hover:bg-pear-green/5 shadow-sm active:scale-95 transition-all duration-200"
-          >
-            Start a Call
-            <span className="inline-block ml-2 group-hover:translate-x-1 transition-transform duration-200">&rarr;</span>
-          </button>
+        {/* Room code actions */}
+        <div className="w-full max-w-md space-y-4">
+          {/* Create room */}
+          {!createdCode ? (
+            <button
+              onClick={handleCreateRoom}
+              className="w-full group px-8 py-4 rounded-2xl bg-pear-green text-white font-bold text-lg shadow-md shadow-pear-green/30 hover:bg-pear-green-dark hover:shadow-lg hover:shadow-pear-green/40 active:scale-95 transition-all duration-200"
+            >
+              Create a Room
+              <span className="inline-block ml-2 group-hover:translate-x-1 transition-transform duration-200">&rarr;</span>
+            </button>
+          ) : (
+            <div className="bg-card border-2 border-pear-green/30 rounded-2xl p-6 animate-fade-in">
+              <p className="text-sm text-fg-muted mb-3">Your room code:</p>
+              <div className="flex items-center justify-center gap-1 mb-4">
+                {createdCode.split("").map((char, i) => (
+                  <span
+                    key={i}
+                    className="w-11 h-14 flex items-center justify-center rounded-xl bg-subtle border border-border-pear text-2xl font-extrabold text-fg tracking-widest font-mono"
+                    style={{ animationDelay: `${i * 60}ms` }}
+                  >
+                    {char}
+                  </span>
+                ))}
+              </div>
+              <p className="text-xs text-fg-muted/60 mb-4">
+                Share this code with whoever you want to call
+              </p>
+              <div className="flex gap-3">
+                <button
+                  onClick={handleCopyCode}
+                  className="flex-1 py-3 rounded-2xl bg-subtle text-fg font-bold border border-border-pear hover:bg-pear-green/10 active:scale-95 transition-all"
+                >
+                  {copied ? "Copied ✓" : "Copy Code"}
+                </button>
+                <button
+                  onClick={handleGoToRoom}
+                  className="flex-1 py-3 rounded-2xl bg-pear-green text-white font-bold hover:bg-pear-green-dark active:scale-95 transition-all shadow-md shadow-pear-green/30"
+                >
+                  Join Room &rarr;
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Divider */}
+          <div className="flex items-center gap-4">
+            <div className="flex-1 h-px bg-border-pear" />
+            <span className="text-xs text-fg-muted/50 font-semibold uppercase tracking-wider">or</span>
+            <div className="flex-1 h-px bg-border-pear" />
+          </div>
+
+          {/* Join room */}
+          <div className="bg-card border border-border-pear rounded-2xl p-6">
+            <p className="text-sm font-semibold text-fg mb-3">Join with a code</p>
+            <div className="flex gap-3">
+              <input
+                type="text"
+                placeholder="Enter room code"
+                value={joinCode}
+                onChange={(e) => {
+                  setJoinCode(e.target.value.toUpperCase());
+                  setJoinError("");
+                }}
+                onKeyDown={(e) => e.key === "Enter" && handleJoinRoom()}
+                maxLength={8}
+                className="flex-1 px-4 py-3 rounded-xl bg-subtle border border-border-pear text-fg font-mono text-lg tracking-widest text-center placeholder:text-fg-muted/30 placeholder:tracking-normal placeholder:font-sans placeholder:text-sm focus:border-pear-green transition-colors"
+              />
+              <button
+                onClick={handleJoinRoom}
+                className="px-6 py-3 rounded-xl bg-pear-green text-white font-bold hover:bg-pear-green-dark active:scale-95 transition-all shadow-md shadow-pear-green/30"
+              >
+                Join
+              </button>
+            </div>
+            {joinError && (
+              <p className="text-red-400 text-xs mt-2 animate-fade-in">{joinError}</p>
+            )}
+          </div>
         </div>
       </section>
 
@@ -95,9 +176,9 @@ export default function Home() {
       <section className="border-t border-border-pear bg-card/50 py-12 px-6">
         <div className="max-w-4xl mx-auto grid grid-cols-1 sm:grid-cols-3 gap-8">
           {[
-            { title: "No accounts",        desc: "Create a room and share the link. That is it." },
-            { title: "Zero server storage", desc: "Files and video travel peer-to-peer. We never see your data." },
-            { title: "AES-256 encrypted",  desc: "The encryption key lives only in the URL hash — invisible to the server." },
+            { title: "No accounts",        desc: "Create a room, share the code. That's it." },
+            { title: "Zero server storage", desc: "Video travels peer-to-peer. We never see your data." },
+            { title: "Room codes",          desc: "Short, easy-to-share codes. No messy links needed." },
           ].map((f) => (
             <div key={f.title} className="card-hover p-6 rounded-2xl bg-card border border-border-pear">
               <div className="w-2 h-2 rounded-full bg-pear-green mb-4" />
