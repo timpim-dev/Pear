@@ -50,6 +50,11 @@ export default function CallPage() {
   const isInitiatorRef = useRef(false);
   const pendingSignalsRef = useRef<unknown[]>([]);
   const setupDoneRef = useRef(false);
+  // ICE servers (STUN + TURN) fetched from /api/ice
+  const iceServersRef = useRef<RTCIceServer[]>([
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+  ]);
 
   // Stop preview stream on unmount
   useEffect(() => {
@@ -58,11 +63,19 @@ export default function CallPage() {
     };
   }, []);
 
-  // Auto-start camera preview on mount
+  // Auto-start camera preview on mount + fetch ICE servers
   useEffect(() => {
     if (!setupDoneRef.current) {
       setupDoneRef.current = true;
       startPreview();
+
+      // Fetch ICE servers (STUN + TURN) for WebRTC
+      fetch("/api/ice")
+        .then((r) => r.json())
+        .then((data) => {
+          if (data.iceServers) iceServersRef.current = data.iceServers;
+        })
+        .catch((err) => console.warn("[ice] Failed to fetch ICE config, using defaults:", err));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -158,10 +171,7 @@ export default function CallPage() {
       stream,
       trickle: true,
       config: {
-        iceServers: [
-          { urls: "stun:stun.l.google.com:19302" },
-          { urls: "stun:stun1.l.google.com:19302" },
-        ],
+        iceServers: iceServersRef.current,
       },
     });
     peerRef.current = peer;

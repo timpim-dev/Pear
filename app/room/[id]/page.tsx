@@ -11,6 +11,14 @@
  *      chunk with AES-GCM using the key from the URL hash, and sends it.
  *   5. The receiver decrypts each chunk, assembles the file, and offers a download.
  *
+ * Signaling handshake (deferred peer creation):
+ *   Both sides connect to the Ably channel. The first arrival sends "ready" and
+ *   waits. When the second peer arrives, they also send "join" (via connect()).
+ *   The first peer sees "join" and responds with "ready", then creates the
+ *   initiator SimplePeer. The second peer sees "ready" and creates the
+ *   responder SimplePeer. This ensures the WebRTC offer is never sent before
+ *   the other side is listening.
+ *
  * The encryption key is derived from window.location.hash — it is NEVER
  * sent in HTTP requests, so the server is blind to it.
  */
@@ -57,6 +65,13 @@ export default function RoomPage() {
   const receivedChunksRef = useRef<Uint8Array[]>([]);
   const receivedSizeRef = useRef(0);
   const roleSetRef = useRef(false);
+  // Stores the fileHeader for the receiver data handler (avoids stale closure)
+  const fileHeaderRef = useRef<FileHeader | null>(null);
+  // ICE servers (STUN + TURN) fetched from /api/ice
+  const iceServersRef = useRef<RTCIceServer[]>([
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+  ]);
 
   useEffect(() => {
     setShareUrl(window.location.href);
@@ -84,54 +99,38 @@ export default function RoomPage() {
       setErrorMsg("Invalid encryption key in URL.");
       setStatus("error");
     });
+
+    // Fetch ICE servers (STUN + TURN) for WebRTC
+    fetch("/api/ice")
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.iceServers) iceServersRef.current = data.iceServers;
+      })
+      .catch((err) => console.warn("[ice] Failed to fetch ICE config, using defaults:", err));
   }, []);
 
-  const setupPeer = useCallback(async (isInitiator: boolean) => {
-    if (!roomId) return;
-    setStatus("connecting");
+  // ─── Create a SimplePeer and wire it up ──────────────────────────────────────
 
-    const signaling = new SignalingChannel(roomId);
-    signalingRef.current = signaling;
-
-    // Buffer signals that arrive before the peer is created
-    const pendingSignals: unknown[] = [];
-
+  const makePeer = useCallback((
+    isInitiator: boolean,
+    signaling: SignalingChannel,
+    pendingSignals: unknown[],
+    dataHandler?: (rawData: Uint8Array | string) => void,
+  ): SimplePeer.Instance => {
     const peer = new SimplePeer({
       initiator: isInitiator,
       trickle: true,
       config: {
-        iceServers: [
-          { urls: "stun:stun.l.google.com:19302" },
-          { urls: "stun:stun1.l.google.com:19302" },
-        ],
+        iceServers: iceServersRef.current,
       },
     });
     peerRef.current = peer;
 
+    // Relay WebRTC signals via Ably
     peer.on("signal", async (data) => {
       const type = data.type === "offer" ? "offer" : data.type === "answer" ? "answer" : "ice";
       await signaling.send(type, data);
     });
-
-    // Register signal handlers BEFORE connecting so we don't miss any messages
-    // from a peer that's already waiting in the room.
-    signaling.onSignal((msg) => {
-      if (msg.type === "offer" || msg.type === "answer" || msg.type === "ice") {
-        if (peerRef.current) {
-          peerRef.current.signal(msg.payload);
-        } else {
-          pendingSignals.push(msg.payload);
-        }
-      }
-      if (msg.type === "join" && isInitiator) setStatus("connecting");
-    });
-
-    await signaling.connect();
-
-    // Feed any signals that arrived during connect
-    for (const sig of pendingSignals) {
-      peer.signal(sig as SimplePeer.SignalData);
-    }
 
     peer.on("connect", () => setStatus("connected"));
     peer.on("error", (err) => {
@@ -141,8 +140,135 @@ export default function RoomPage() {
     });
     peer.on("close", () => setStatus("idle"));
 
+    // Attach data handler if provided (receiver only)
+    if (dataHandler) {
+      peer.on("data", dataHandler);
+    }
+
+    // Feed any signals that arrived before the peer was created
+    for (const sig of pendingSignals) {
+      peer.signal(sig as SimplePeer.SignalData);
+    }
+    pendingSignals.length = 0;
+
     return peer;
-  }, [roomId]);
+  }, []);
+
+  // ─── Sender: connect to signaling, wait for receiver, THEN create peer ──────
+
+  const connectAsSender = useCallback(async () => {
+    if (!roomId) return;
+    setStatus("waiting");
+
+    const signaling = new SignalingChannel(roomId);
+    signalingRef.current = signaling;
+    const pendingSignals: unknown[] = [];
+
+    // Register handlers BEFORE connecting so we don't miss the receiver's "join"
+    signaling.onSignal((msg) => {
+      if (msg.type === "join") {
+        // Receiver just arrived — NOW create the initiator peer
+        if (!peerRef.current) {
+          setStatus("connecting");
+          makePeer(true, signaling, pendingSignals);
+          // Tell receiver we're ready so they create their responder peer
+          signaling.send("ready", { peerId: signaling.id });
+        }
+      }
+      if (msg.type === "offer" || msg.type === "answer" || msg.type === "ice") {
+        if (peerRef.current) {
+          peerRef.current.signal(msg.payload);
+        } else {
+          pendingSignals.push(msg.payload);
+        }
+      }
+    });
+
+    await signaling.connect();
+    // connect() sends "join" automatically. Also send "ready" so if the
+    // receiver is already waiting, they know we're here.
+    await signaling.send("ready", { peerId: signaling.id });
+  }, [roomId, makePeer]);
+
+  // ─── Receiver: connect to signaling, wait for sender's "ready", create peer ─
+
+  const connectAsReceiver = useCallback(async () => {
+    if (!roomId) return;
+    setStatus("waiting");
+
+    const signaling = new SignalingChannel(roomId);
+    signalingRef.current = signaling;
+    const pendingSignals: unknown[] = [];
+
+    // Build the data handler for receiving file chunks
+    const dataHandler = async (rawData: Uint8Array | string) => {
+      try {
+        const str = typeof rawData === "string" ? rawData : new TextDecoder().decode(rawData);
+        const parsed = JSON.parse(str);
+
+        if (parsed.__header) {
+          const header = parsed.__header as FileHeader;
+          fileHeaderRef.current = header;
+          setFileHeader(header);
+          setStatus("transferring");
+          return;
+        }
+        if (parsed.__done) {
+          const blob = new Blob(receivedChunksRef.current.map((c) => c.buffer as ArrayBuffer), {
+            type: fileHeaderRef.current?.type ?? "application/octet-stream",
+          });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = fileHeaderRef.current?.name ?? "download";
+          a.click();
+          URL.revokeObjectURL(url);
+          setProgress(100);
+          setStatus("done");
+          return;
+        }
+      } catch { /* binary chunk — fall through */ }
+
+      if (!keyRef.current) return;
+      const bytes = typeof rawData === "string" ? new TextEncoder().encode(rawData) : rawData;
+      try {
+        const decrypted = await decryptChunk(keyRef.current, bytes);
+        receivedChunksRef.current.push(decrypted);
+        receivedSizeRef.current += decrypted.length;
+        const hdr = fileHeaderRef.current;
+        if (hdr) {
+          setProgress(Math.min(100, Math.round((receivedSizeRef.current / hdr.size) * 100)));
+        }
+      } catch (err) {
+        console.error("[decrypt] failed:", err);
+        setErrorMsg("Decryption failed. The file may be corrupted.");
+        setStatus("error");
+      }
+    };
+
+    // Register handlers BEFORE connecting
+    signaling.onSignal((msg) => {
+      if (msg.type === "join" || msg.type === "ready") {
+        // Sender is present — create responder peer
+        if (!peerRef.current) {
+          setStatus("connecting");
+          makePeer(false, signaling, pendingSignals, dataHandler);
+        }
+      }
+      if (msg.type === "offer" || msg.type === "answer" || msg.type === "ice") {
+        if (peerRef.current) {
+          peerRef.current.signal(msg.payload);
+        } else {
+          pendingSignals.push(msg.payload);
+        }
+      }
+    });
+
+    await signaling.connect();
+    // connect() sends "join" — the sender will see it and create its initiator peer
+  }, [roomId, makePeer]);
+
+  // ─── Role entry points ──────────────────────────────────────────────────────
 
   function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -151,9 +277,23 @@ export default function RoomPage() {
     if (!roleSetRef.current) {
       roleSetRef.current = true;
       setRole("sender");
-      setStatus("waiting");
     }
   }
+
+  function becomeReceiver() {
+    roleSetRef.current = true;
+    setRole("receiver");
+    connectAsReceiver();
+  }
+
+  // When the sender role is set, connect to signaling
+  useEffect(() => {
+    if (role !== "sender" || signalingRef.current) return;
+    connectAsSender();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [role]);
+
+  // ─── Auto-start transfer once connected ─────────────────────────────────────
 
   async function startTransfer(peer: SimplePeer.Instance, file: File) {
     if (!keyRef.current) return;
@@ -203,66 +343,7 @@ export default function RoomPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, role, selectedFile]);
 
-  function setupReceiverDataHandler(peer: SimplePeer.Instance) {
-    peer.on("data", async (rawData: Uint8Array | string) => {
-      try {
-        const str = typeof rawData === "string" ? rawData : new TextDecoder().decode(rawData);
-        const parsed = JSON.parse(str);
-
-        if (parsed.__header) {
-          setFileHeader(parsed.__header as FileHeader);
-          setStatus("transferring");
-          return;
-        }
-        if (parsed.__done) {
-          const blob = new Blob(receivedChunksRef.current.map((c) => c.buffer as ArrayBuffer), {
-            type: fileHeader?.type ?? "application/octet-stream",
-          });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = fileHeader?.name ?? "download";
-          a.click();
-          URL.revokeObjectURL(url);
-          setProgress(100);
-          setStatus("done");
-          return;
-        }
-      } catch { /* binary chunk */ }
-
-      if (!keyRef.current) return;
-      const bytes = typeof rawData === "string" ? new TextEncoder().encode(rawData) : rawData;
-      try {
-        const decrypted = await decryptChunk(keyRef.current, bytes);
-        receivedChunksRef.current.push(decrypted);
-        receivedSizeRef.current += decrypted.length;
-        if (fileHeader) {
-          setProgress(Math.min(100, Math.round((receivedSizeRef.current / fileHeader.size) * 100)));
-        }
-      } catch (err) {
-        console.error("[decrypt] failed:", err);
-        setErrorMsg("Decryption failed. The file may be corrupted.");
-        setStatus("error");
-      }
-    });
-  }
-
-  async function becomeReceiver() {
-    roleSetRef.current = true;
-    setRole("receiver");
-    setStatus("waiting");
-    const peer = await setupPeer(false);
-    if (peer) setupReceiverDataHandler(peer);
-  }
-
-  useEffect(() => {
-    if (role !== "sender" || peerRef.current) return;
-    setupPeer(true).then((peer) => {
-      if (!peer) return;
-      peer.on("connect", () => setStatus("connected"));
-    });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [role]);
+  // ─── Helpers ────────────────────────────────────────────────────────────────
 
   function copyLink() {
     navigator.clipboard.writeText(shareUrl).then(() => {
