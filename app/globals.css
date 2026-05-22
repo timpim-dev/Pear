@@ -30,6 +30,7 @@
   --color-pear-green:       var(--pear-green);
   --color-pear-green-light: var(--pear-green-light);
   --color-pear-green-dark:  var(--pear-green-dark);
+  --color-pear-dark:        #0c100c;
 
   /* Semantic aliases so we can write bg-surface, text-fg, etc. */
   --color-surface:      var(--bg);

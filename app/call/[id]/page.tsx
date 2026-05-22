@@ -25,7 +25,7 @@ import SimplePeer from "simple-peer";
 import { SignalingChannel } from "@/lib/signaling";
 import { ThemeToggle } from "@/components/ThemeToggle";
 
-type CallStatus = "idle" | "waiting" | "connecting" | "connected" | "ended" | "error";
+type CallStatus = "idle" | "setup" | "waiting" | "connecting" | "connected" | "ended" | "error";
 
 export default function CallPage() {
   const params = useParams();
@@ -39,14 +39,21 @@ export default function CallPage() {
   const [copied, setCopied] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
 
+  // Device selection
+  const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedVideoId, setSelectedVideoId] = useState("");
+  const [selectedAudioId, setSelectedAudioId] = useState("");
+
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const previewVideoRef = useRef<HTMLVideoElement>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
   const peerRef = useRef<SimplePeer.Instance | null>(null);
   const signalingRef = useRef<SignalingChannel | null>(null);
   const isInitiatorRef = useRef(false);
-  const joinedRef = useRef(false);
+  const pendingSignalsRef = useRef<unknown[]>([]);
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -54,96 +61,212 @@ export default function CallPage() {
     }
   }, []);
 
-  const startCall = useCallback(async (isInitiator: boolean) => {
-    if (joinedRef.current) return;
-    joinedRef.current = true;
-    isInitiatorRef.current = isInitiator;
+  // Stop preview stream on unmount
+  useEffect(() => {
+    return () => {
+      localStreamRef.current?.getTracks().forEach((t) => t.stop());
+    };
+  }, []);
 
-    setStatus("waiting");
+  // ─── Device enumeration ─────────────────────────────────────────────────────
 
+  const enumerateDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
     try {
-      // Request camera and microphone access
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: true,
-      });
-      localStreamRef.current = stream;
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      setVideoDevices(devices.filter((d) => d.kind === "videoinput"));
+      setAudioDevices(devices.filter((d) => d.kind === "audioinput"));
+    } catch (err) {
+      console.error("Failed to enumerate devices:", err);
+    }
+  }, []);
 
-      // Show local preview (muted to avoid feedback)
+  // ─── Preview stream (pre-call) ──────────────────────────────────────────────
+
+  const startPreview = useCallback(
+    async (videoId?: string, audioId?: string) => {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setErrorMsg(
+          "Camera/mic access requires a secure context (HTTPS). " +
+            "Run the dev server with HTTPS or access via localhost."
+        );
+        setStatus("error");
+        return;
+      }
+
+      try {
+        // Stop existing preview
+        localStreamRef.current?.getTracks().forEach((t) => t.stop());
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: videoId
+            ? { deviceId: { exact: videoId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+            : { width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: audioId ? { deviceId: { exact: audioId } } : true,
+        });
+        localStreamRef.current = stream;
+
+        if (previewVideoRef.current) {
+          previewVideoRef.current.srcObject = stream;
+        }
+
+        // After permission granted, enumerate to get real device labels
+        await enumerateDevices();
+
+        // Auto-select whatever device the browser picked
+        if (!videoId) {
+          const vTrack = stream.getVideoTracks()[0];
+          if (vTrack) setSelectedVideoId(vTrack.getSettings().deviceId || "");
+        }
+        if (!audioId) {
+          const aTrack = stream.getAudioTracks()[0];
+          if (aTrack) setSelectedAudioId(aTrack.getSettings().deviceId || "");
+        }
+
+        setStatus("setup");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("Permission denied") || msg.includes("NotAllowed")) {
+          setErrorMsg("Camera/mic access denied. Please allow permissions and try again.");
+        } else {
+          setErrorMsg(`Failed to access camera: ${msg}`);
+        }
+        setStatus("error");
+      }
+    },
+    [enumerateDevices]
+  );
+
+  // When user changes camera/mic in the dropdowns, restart preview
+  function handleVideoChange(deviceId: string) {
+    setSelectedVideoId(deviceId);
+    startPreview(deviceId, selectedAudioId || undefined);
+  }
+  function handleAudioChange(deviceId: string) {
+    setSelectedAudioId(deviceId);
+    startPreview(selectedVideoId || undefined, deviceId);
+  }
+
+  // ─── Create a SimplePeer and wire it up ─────────────────────────────────────
+
+  function createPeer(
+    stream: MediaStream,
+    signaling: SignalingChannel,
+    isInitiator: boolean
+  ): SimplePeer.Instance {
+    const peer = new SimplePeer({
+      initiator: isInitiator,
+      stream,
+      trickle: true,
+      config: {
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:stun1.l.google.com:19302" },
+        ],
+      },
+    });
+    peerRef.current = peer;
+
+    // Relay our WebRTC signals via Ably
+    peer.on("signal", async (data) => {
+      const type =
+        data.type === "offer" ? "offer" : data.type === "answer" ? "answer" : "ice";
+      await signaling.send(type, data);
+    });
+
+    // When the P2P connection is established
+    peer.on("connect", () => setStatus("connected"));
+
+    // When we receive the remote peer's stream — attach to video element
+    peer.on("stream", (remoteStream: MediaStream) => {
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = remoteStream;
+      }
+      setStatus("connected");
+    });
+
+    peer.on("error", (err) => {
+      console.error("[peer] call error:", err);
+      setErrorMsg(`Connection error: ${err.message}`);
+      setStatus("error");
+    });
+
+    peer.on("close", () => {
+      setStatus("ended");
+      cleanup();
+    });
+
+    // Feed any signals that arrived before the peer was created
+    for (const sig of pendingSignalsRef.current) {
+      peer.signal(sig as SimplePeer.SignalData);
+    }
+    pendingSignalsRef.current = [];
+
+    return peer;
+  }
+
+  // ─── Start the call (after setup) ───────────────────────────────────────────
+
+  const connectCall = useCallback(
+    async (isInitiator: boolean) => {
+      isInitiatorRef.current = isInitiator;
+      setStatus("waiting");
+
+      const stream = localStreamRef.current;
+      if (!stream) {
+        setErrorMsg("No camera stream available.");
+        setStatus("error");
+        return;
+      }
+
+      // Show local preview in the call view
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
       }
 
-      // Connect to Ably signaling
-      const signaling = new SignalingChannel(roomId);
-      signalingRef.current = signaling;
-      await signaling.connect();
+      try {
+        const signaling = new SignalingChannel(roomId);
+        signalingRef.current = signaling;
 
-      // Create simple-peer with the local media stream
-      const peer = new SimplePeer({
-        initiator: isInitiator,
-        stream,
-        trickle: true,
-        config: {
-          iceServers: [
-            { urls: "stun:stun.l.google.com:19302" },
-            { urls: "stun:stun1.l.google.com:19302" },
-          ],
-        },
-      });
-      peerRef.current = peer;
+        // Register signal handlers BEFORE connecting so we don't miss
+        // the other peer's "join" or any signals that arrive immediately.
+        signaling.onSignal((msg) => {
+          if (msg.type === "join") {
+            if (isInitiator && !peerRef.current) {
+              // The joiner is subscribed and ready — NOW create our peer.
+              // This ensures the offer we generate will actually be received.
+              setStatus("connecting");
+              createPeer(stream, signaling, true);
+            }
+          }
+          if (msg.type === "offer" || msg.type === "answer" || msg.type === "ice") {
+            if (peerRef.current) {
+              peerRef.current.signal(msg.payload);
+            } else {
+              // Buffer signals that arrive before peer is created
+              pendingSignalsRef.current.push(msg.payload);
+            }
+          }
+        });
 
-      // Relay our WebRTC signals via Ably
-      peer.on("signal", async (data) => {
-        const type = data.type === "offer" ? "offer"
-          : data.type === "answer" ? "answer"
-          : "ice";
-        await signaling.send(type, data);
-      });
+        await signaling.connect();
 
-      // Feed incoming Ably signals into simple-peer
-      signaling.onSignal((msg) => {
-        if (msg.type === "offer" || msg.type === "answer" || msg.type === "ice") {
-          peer.signal(msg.payload);
+        // Non-initiator: create peer immediately (it's passive, waits for offer)
+        if (!isInitiator) {
+          createPeer(stream, signaling, false);
         }
-        if (msg.type === "join" && isInitiator) {
-          setStatus("connecting");
-        }
-      });
-
-      // When the P2P connection is established
-      peer.on("connect", () => {
-        setStatus("connected");
-      });
-
-      // When we receive the remote peer's stream — attach to video element
-      peer.on("stream", (remoteStream: MediaStream) => {
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = remoteStream;
-        }
-        setStatus("connected");
-      });
-
-      peer.on("error", (err) => {
-        console.error("[peer] call error:", err);
-        setErrorMsg(`Connection error: ${err.message}`);
-        setStatus("error");
-      });
-
-      peer.on("close", () => {
-        setStatus("ended");
-        cleanup();
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("Permission denied") || msg.includes("NotAllowed")) {
-        setErrorMsg("Camera/mic access denied. Please allow permissions and try again.");
-      } else {
+        // Initiator: peer is created when we receive a "join" from the joiner
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
         setErrorMsg(`Failed to start call: ${msg}`);
+        setStatus("error");
       }
-      setStatus("error");
-    }
-  }, [roomId]);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [roomId]
+  );
+
+  // ─── Cleanup ────────────────────────────────────────────────────────────────
 
   function cleanup() {
     localStreamRef.current?.getTracks().forEach((t) => t.stop());
@@ -154,6 +277,8 @@ export default function CallPage() {
     screenStreamRef.current = null;
     peerRef.current = null;
   }
+
+  // ─── In-call controls ──────────────────────────────────────────────────────
 
   // Mute/unmute microphone
   function toggleMute() {
@@ -253,9 +378,11 @@ export default function CallPage() {
     });
   }
 
+  // ─── Render ─────────────────────────────────────────────────────────────────
+
   return (
     <main className="min-h-screen bg-pear-dark flex flex-col items-center justify-center relative overflow-hidden">
-      {/* Pre-call overlay */}
+      {/* Pre-call overlay — choose Host or Join */}
       {status === "idle" && (
         <div className="absolute inset-0 flex flex-col items-center justify-center bg-pear-dark z-20 animate-fade-in px-4">
           <div className="flex items-center gap-3 mb-2">
@@ -269,7 +396,7 @@ export default function CallPage() {
           <div className="bg-white/5 border border-white/10 rounded-2xl p-8 w-full max-w-md text-center">
             <h2 className="text-xl font-bold text-white mb-2">Ready to call?</h2>
             <p className="text-white/50 text-sm mb-6">
-              Share the link with your contact, then join the call.
+              Share the link with your contact, then set up your camera.
             </p>
 
             {/* Share link */}
@@ -289,18 +416,93 @@ export default function CallPage() {
 
             <div className="flex gap-3">
               <button
-                onClick={() => startCall(true)}
+                onClick={() => {
+                  isInitiatorRef.current = true;
+                  startPreview();
+                }}
                 className="flex-1 py-3 rounded-2xl bg-pear-green text-white font-bold hover:bg-pear-green-dark transition-colors active:scale-95"
               >
                 Start Call (Host)
               </button>
               <button
-                onClick={() => startCall(false)}
+                onClick={() => {
+                  isInitiatorRef.current = false;
+                  startPreview();
+                }}
                 className="flex-1 py-3 rounded-2xl bg-white/10 text-white font-bold border border-white/15 hover:bg-white/15 transition-colors active:scale-95"
               >
                 Join Call
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Setup overlay — camera preview + device selection */}
+      {status === "setup" && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-pear-dark z-20 animate-fade-in px-4">
+          <div className="flex items-center gap-3 mb-2">
+            <a href="/" className="text-2xl font-extrabold text-white tracking-tight">
+              Pear
+            </a>
+            <ThemeToggle />
+          </div>
+          <p className="text-pear-green/70 text-sm mb-6">Check your camera &amp; mic</p>
+
+          <div className="bg-white/5 border border-white/10 rounded-2xl p-6 w-full max-w-lg">
+            {/* Camera preview */}
+            <div className="relative aspect-video rounded-xl overflow-hidden bg-black mb-5">
+              <video
+                ref={previewVideoRef}
+                autoPlay
+                playsInline
+                muted
+                className="w-full h-full object-cover"
+              />
+            </div>
+
+            {/* Device selectors */}
+            <div className="space-y-3 mb-6">
+              {/* Camera */}
+              <div>
+                <label className="text-white/60 text-xs font-semibold block mb-1">Camera</label>
+                <select
+                  value={selectedVideoId}
+                  onChange={(e) => handleVideoChange(e.target.value)}
+                  className="w-full bg-white/10 border border-white/10 rounded-xl px-3 py-2 text-sm text-white appearance-none cursor-pointer hover:bg-white/15 transition-colors"
+                >
+                  {videoDevices.map((d, i) => (
+                    <option key={d.deviceId} value={d.deviceId} className="bg-[#1a1a1a] text-white">
+                      {d.label || `Camera ${i + 1}`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Microphone */}
+              <div>
+                <label className="text-white/60 text-xs font-semibold block mb-1">Microphone</label>
+                <select
+                  value={selectedAudioId}
+                  onChange={(e) => handleAudioChange(e.target.value)}
+                  className="w-full bg-white/10 border border-white/10 rounded-xl px-3 py-2 text-sm text-white appearance-none cursor-pointer hover:bg-white/15 transition-colors"
+                >
+                  {audioDevices.map((d, i) => (
+                    <option key={d.deviceId} value={d.deviceId} className="bg-[#1a1a1a] text-white">
+                      {d.label || `Microphone ${i + 1}`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {/* Join button */}
+            <button
+              onClick={() => connectCall(isInitiatorRef.current)}
+              className="w-full py-3 rounded-2xl bg-pear-green text-white font-bold text-lg hover:bg-pear-green-dark transition-colors active:scale-95"
+            >
+              {isInitiatorRef.current ? "Start Call" : "Join Call"}
+            </button>
           </div>
         </div>
       )}

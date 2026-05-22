@@ -60,6 +60,18 @@ export default function RoomPage() {
 
   useEffect(() => {
     setShareUrl(window.location.href);
+
+    // crypto.subtle requires a secure context (HTTPS or localhost).
+    // On plain HTTP with a LAN IP it will be undefined.
+    if (!window.crypto?.subtle) {
+      setErrorMsg(
+        "Encryption requires a secure context (HTTPS). " +
+        "Run the dev server with HTTPS or access via localhost."
+      );
+      setStatus("error");
+      return;
+    }
+
     const hash = window.location.hash;
     if (!hash) {
       setErrorMsg("No encryption key found in URL. Please use a valid room link.");
